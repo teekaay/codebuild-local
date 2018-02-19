@@ -1,0 +1,146 @@
+#!/usr/bin/env python
+# vim: set filetype=python
+
+import logging
+import yaml
+import argparse
+import sys
+import os
+import boto3
+
+ssm = boto3.client('ssm')
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Run buildspec yaml files locally in docker')
+    parser.add_argument('--docker-image', help='Name of the docker image to use. Defaults to debian', default='debian:8')
+    parser.add_argument('--dockerfile', help='Path to the generated Dockerfile. If not specified, the Dockerfile will be printed to stdout')
+    parser.add_argument('--buildspec', help='Path to buildspec file. Defaults to buildspec.yaml', default='buildspec.yaml')
+    parser.add_argument('--context-dir', help='Docker context directory. Defaults to current working directory', default='.')
+    parser.add_argument('--project', help='Name of the project. If not provided a random UUID will be generated')
+    parser.add_argument('--rm', help='If set, intermediate files will be cleaned up', action='store_true')
+    parser.add_argument('--verbose', help='Enable verbose logging', action='store_true')
+
+    args = parser.parse_args()
+
+    logger = logging.getLogger('codebuildlocal')
+    logging.basicConfig(level=logging.INFO)
+
+    if args.verbose:
+        logger.setLevel(logging.VERBOSE)
+
+    buildspec = None
+
+    try:
+        with open(args.buildspec, 'r') as bsf:
+            buildspec = yaml.load(bsf)
+    except Exception as e:
+        logger.error('failed to read buildspec file [{}]: [{}]'.format(args.buildspec, e))
+        sys.exit(1)
+
+    project_name = args.project
+    if project_name is None:
+        import uuid
+        project_name = str(uuid.uuid4()).replace('-', '')
+
+    logger.info('using project name [{}]'.format(project_name))
+
+    buildspec_version = str(buildspec.get('version'))
+    if buildspec_version != '0.2':
+        logger.error('unsupported buildspec version [{}]'.format(buildspec_version))
+        sys.exit(-1)
+
+    docker_env = dict()
+    for k, v in buildspec.get('env').get('variables').items():
+        docker_env[k] = v
+    for k, v in buildspec.get('env').get('parameter-store').items():
+        ssm_param = ssm.get_parameter(
+            Name=k,
+            WithDecryption=True
+        )
+        docker_env[k] = ssm_param.get('Value')
+
+    docker_commands = []
+    phases = [
+        'install',
+        'pre_build',
+        'build',
+        'post_build'
+    ]
+
+    for phase in phases:
+        logger.info('phase [{}]'.format(phase))
+        for command in buildspec.get('phases').get(phase).get('commands', []):
+            docker_commands.append('RUN {}'.format(command))
+
+    dockerfile = []
+    dockerfile.append('FROM {}'.format(args.docker_image))
+
+    for k, v in docker_env.items():
+        dockerfile.append('ENV {}={}'.format(k, v))
+
+    dockerfile.append('COPY {} .'.format(args.context_dir))
+
+    for command in docker_commands:
+        dockerfile.append(command)
+
+    dockerfile_body = '\n'.join(dockerfile)
+    dockerfile_id = 'codebuildlocal{}'.format(project_name)
+    dockerfile_location = '{}/Dockerfile.{}'.format(args.context_dir, dockerfile_id)
+
+    if args.dockerfile:
+        dockerfile_location = args.dockerfile
+
+    logger.info('using temporary dockerfile [{}]'.format(dockerfile_location))
+
+    print(dockerfile_body)
+
+    with open(dockerfile_location, 'w') as df:
+        df.write(dockerfile_body)
+
+    import subprocess
+    docker_build_cmd = [
+        'docker',
+        'build',
+        '--rm',
+        '-t',
+        '{}'.format(dockerfile_id),
+        '-f'
+        '{}'.format(dockerfile_location),
+        '{}'.format(args.context_dir)
+    ]
+
+    logger.info('using docker build command [{}]'.format(' '.join(docker_build_cmd)))
+    logger.info('starting docker build')
+
+    def cleanup(files_to_cleanup=[]):
+        for f in files_to_cleanup:
+            try:
+                logger.info('cleaning up intermediate file [{}]'.format(f))
+                os.remove(f)
+            except Exception as e:
+                logger.error('failed to remove intermediate file [{}]'.format(f))
+
+    with subprocess.Popen(docker_build_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True) as proc:
+        for line in proc.stdout:
+            print(line, end='')
+        streamdata = proc.communicate()[0]
+        rc = proc.returncode
+        if rc != 0:
+            logger.info('failed to execute docker build')
+            sys.exit()
+
+    if args.rm:
+        files_to_cleanup = [
+            dockerfile_location
+        ]
+        cleanup(files_to_cleanup=files_to_cleanup)
+
+        with subprocess.Popen(['docker', 'rmi', dockerfile_id], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True) as proc:
+            for line in proc.stdout:
+                print(line, end='')
+            streamdata = proc.communicate()[0]
+            rc = proc.returncode
+            if rc != 0:
+                logger.info('failed to execute docker rmi')
+                sys.exit()
+

@@ -1,0 +1,27 @@
+---
+version: '0.2'
+
+env:
+  variables:
+    key1: "value"
+    key2: "value"
+  parameter-store: {}
+
+phases:
+  install:
+    commands:
+      - apt-get update -y
+  pre_build:
+    commands:
+      - echo "Validating config file $CONFIG_FILE"
+  build:
+    commands:
+      - echo "Validating resources..."
+      - exit $?
+  post_build:
+    commands: []
+
+artifacts:
+  files: []
+  discard-paths: "yes"
+  base-directory: "."
